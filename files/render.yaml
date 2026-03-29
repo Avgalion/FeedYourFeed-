@@ -1,0 +1,13 @@
+services:
+  - type: worker
+    name: jolly-shopify-sync
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python scheduler.py
+    envVars:
+      - key: FEED_URL
+        sync: false   # completezi în dashboard-ul Render
+      - key: SHOP_DOMAIN
+        sync: false
+      - key: ACCESS_TOKEN
+        sync: false
