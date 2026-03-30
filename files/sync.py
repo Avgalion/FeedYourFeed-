@@ -12,31 +12,52 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-FEED_URL       = os.environ["FEED_URL"]          # XML feed URL
-SHOP_DOMAIN    = os.environ["SHOP_DOMAIN"]       # ex: mystore.myshopify.com
-ACCESS_TOKEN   = os.environ["ACCESS_TOKEN"]      # Shopify Admin API token
-API_VERSION    = "2024-01"
-BASE_URL       = f"https://{SHOP_DOMAIN}/admin/api/{API_VERSION}"
-HEADERS        = {
-    "X-Shopify-Access-Token": ACCESS_TOKEN,
-    "Content-Type": "application/json",
-}
+FEED_URL = os.environ["FEED_URL"]                         # XML feed URL
+SHOP_DOMAIN = os.environ["SHOP_DOMAIN"]                   # ex: mystore.myshopify.com
+SHOPIFY_CLIENT_ID = os.environ["SHOPIFY_CLIENT_ID"]       # Shopify app client id
+SHOPIFY_CLIENT_SECRET = os.environ["SHOPIFY_CLIENT_SECRET"]  # Shopify app client secret
+
+API_VERSION = "2026-01"
+BASE_URL = f"https://{SHOP_DOMAIN}/admin/api/{API_VERSION}"
 RATE_LIMIT_DELAY = 0.5   # secunde între request-uri
 
+def get_access_token():
+    url = f"https://{SHOP_DOMAIN}/admin/oauth/access_token"
+    payload = {
+        "client_id": SHOPIFY_CLIENT_ID,
+        "client_secret": SHOPIFY_CLIENT_SECRET,
+        "grant_type": "client_credentials",
+    }
+
+    r = requests.post(url, json=payload, timeout=60)
+    log.info(f"Token response status: {r.status_code}")
+    log.info(f"Token response body: {r.text}")
+    r.raise_for_status()
+
+    data = r.json()
+    return data["access_token"]
+
+
+def shopify_headers():
+    token = get_access_token()
+    return {
+        "X-Shopify-Access-Token": token,
+        "Content-Type": "application/json",
+    }
 
 # ── Shopify helpers ───────────────────────────────────────────────────────────
 def shopify_get(endpoint, params=None):
-    r = requests.get(f"{BASE_URL}{endpoint}", headers=HEADERS, params=params)
+    r = requests.get(f"{BASE_URL}{endpoint}", headers=shopify_headers(), params=params)
     r.raise_for_status()
     return r.json()
 
 def shopify_post(endpoint, payload):
-    r = requests.post(f"{BASE_URL}{endpoint}", headers=HEADERS, json=payload)
+    r = requests.post(f"{BASE_URL}{endpoint}", headers=shopify_headers(), json=payload)
     r.raise_for_status()
     return r.json()
 
 def shopify_put(endpoint, payload):
-    r = requests.put(f"{BASE_URL}{endpoint}", headers=HEADERS, json=payload)
+    r = requests.put(f"{BASE_URL}{endpoint}", headers=shopify_headers(), json=payload)
     r.raise_for_status()
     return r.json()
 
