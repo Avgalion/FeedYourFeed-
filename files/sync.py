@@ -70,13 +70,11 @@ def parse_feed(url):
 
     products = []
 
-    # Detectăm automat structura: <products><product>...</product></products>
-    # sau <SHOPITEM> / <item> etc.
     items = (
+        root.findall(".//Product") or
         root.findall(".//product") or
         root.findall(".//SHOPITEM") or
-        root.findall(".//item") or
-        root.findall(".//Product")
+        root.findall(".//item")
     )
 
     if not items:
@@ -87,49 +85,58 @@ def parse_feed(url):
 
     for item in items:
         def g(tag):
-            """Caută tag case-insensitive."""
             for child in item:
                 if child.tag.lower() == tag.lower():
                     return (child.text or "").strip()
             return ""
 
-        # Câmpuri standard — adaptate automat la tag-urile din feed Jolly
-        sku         = g("sku") or g("cod") or g("code") or g("id")
-        title       = g("title") or g("name") or g("denumire") or g("nume")
+        sku         = g("reference") or g("sku") or g("cod") or g("code") or g("id")
+        title       = g("name") or g("title") or g("denumire") or g("nume")
         description = g("description") or g("descriere") or g("body")
-        price       = g("price") or g("pret") or g("price_with_vat")
-        stock_raw   = g("stock") or g("stoc") or g("quantity") or g("cantitate") or "0"
+        price_raw   = g("pret") or g("price") or g("price_with_vat")
+        stock_raw   = g("stoc") or g("stock") or g("quantity") or g("cantitate") or "0"
         image_url   = g("image") or g("imagine") or g("image_url") or g("img")
         category    = g("category") or g("categorie") or g("categories")
+        barcode     = g("barcodes_barcode") or g("barcode")
 
-        # Curăță prețul (elimină valuta, spații)
-        price = price.replace("RON", "").replace("Lei", "").replace(",", ".").strip()
+        if not sku:
+            continue
+
+        price_clean = (
+            price_raw.replace("RON", "")
+            .replace("Lei", "")
+            .replace("lei", "")
+            .replace(" ", "")
+            .replace(".", "")
+            .replace(",", ".")
+            .strip()
+        )
+
         try:
-            price = f"{float(price):.2f}"
+            price = f"{float(price_clean):.2f}"
         except ValueError:
             price = "0.00"
 
-        # Curăță stocul
         try:
             stock = int(float(stock_raw.replace(",", ".")))
         except ValueError:
             stock = 0
 
-        if not sku:
-            continue
-
         products.append({
-            "sku":         sku,
-            "title":       title or sku,
+            "sku": sku,
+            "title": title or sku,
             "description": description,
-            "price":       price,
-            "stock":       stock,
-            "image_url":   image_url,
-            "category":    category,
+            "price": price,
+            "stock": stock,
+            "image_url": image_url,
+            "category": category,
+            "barcode": barcode,
         })
 
-    return products
+        if len(products) <= 5:
+            log.info(f"Parsed: sku={sku}, title={title}, price={price}, stock={stock}")
 
+    return products
 
 # ── Shopify sync ──────────────────────────────────────────────────────────────
 def get_location_id():
