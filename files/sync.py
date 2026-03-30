@@ -4,6 +4,7 @@ import xml.etree.ElementTree as ET
 import logging
 import time
 from datetime import datetime
+from urllib.parse import parse_qs, urlparse
 
 logging.basicConfig(
     level=logging.INFO,
@@ -12,15 +13,19 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-FEED_URL = os.environ["FEED_URL"]                         # XML feed URL
-SHOP_DOMAIN = os.environ["SHOP_DOMAIN"]                   # ex: mystore.myshopify.com
-SHOPIFY_CLIENT_ID = os.environ["SHOPIFY_CLIENT_ID"]       # Shopify app client id
-SHOPIFY_CLIENT_SECRET = os.environ["SHOPIFY_CLIENT_SECRET"]  # Shopify app client secret
+FEED_URL = os.environ["FEED_URL"]
+SHOP_DOMAIN = os.environ["SHOP_DOMAIN"]
+SHOPIFY_CLIENT_ID = os.environ["SHOPIFY_CLIENT_ID"]
+SHOPIFY_CLIENT_SECRET = os.environ["SHOPIFY_CLIENT_SECRET"]
 
 API_VERSION = "2026-01"
 BASE_URL = f"https://{SHOP_DOMAIN}/admin/api/{API_VERSION}"
-RATE_LIMIT_DELAY = 0.5   # secunde între request-uri
+RATE_LIMIT_DELAY = 0.5
 
+ACCESS_TOKEN_CACHE = None
+
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
 def get_access_token():
     url = f"https://{SHOP_DOMAIN}/admin/oauth/access_token"
     payload = {
@@ -30,8 +35,6 @@ def get_access_token():
     }
 
     r = requests.post(url, json=payload, timeout=60)
-    log.info(f"Token response status: {r.status_code}")
-    log.info(f"Token response body: {r.text}")
     r.raise_for_status()
 
     data = r.json()
@@ -39,61 +42,102 @@ def get_access_token():
 
 
 def shopify_headers():
-    token = get_access_token()
+    global ACCESS_TOKEN_CACHE
+
+    if not ACCESS_TOKEN_CACHE:
+        ACCESS_TOKEN_CACHE = get_access_token()
+        log.info("Shopify access token obținut.")
+
     return {
-        "X-Shopify-Access-Token": token,
+        "X-Shopify-Access-Token": ACCESS_TOKEN_CACHE,
         "Content-Type": "application/json",
     }
 
+
 # ── Shopify helpers ───────────────────────────────────────────────────────────
 def shopify_get(endpoint, params=None):
-    r = requests.get(f"{BASE_URL}{endpoint}", headers=shopify_headers(), params=params)
+    r = requests.get(f"{BASE_URL}{endpoint}", headers=shopify_headers(), params=params, timeout=60)
     r.raise_for_status()
-    return r.json()
+    return r
+
 
 def shopify_post(endpoint, payload):
-    r = requests.post(f"{BASE_URL}{endpoint}", headers=shopify_headers(), json=payload)
+    r = requests.post(f"{BASE_URL}{endpoint}", headers=shopify_headers(), json=payload, timeout=60)
     r.raise_for_status()
     return r.json()
+
 
 def shopify_put(endpoint, payload):
-    r = requests.put(f"{BASE_URL}{endpoint}", headers=shopify_headers(), json=payload)
+    r = requests.put(f"{BASE_URL}{endpoint}", headers=shopify_headers(), json=payload, timeout=60)
     r.raise_for_status()
     return r.json()
 
+
+def extract_next_page_info(link_header):
+    """
+    Parsează Link header de la Shopify și întoarce page_info pentru pagina următoare.
+    """
+    if not link_header:
+        return None
+
+    parts = link_header.split(",")
+    for part in parts:
+        if 'rel="next"' in part:
+            url_part = part.split(";")[0].strip().strip("<>").strip()
+            parsed = urlparse(url_part)
+            qs = parse_qs(parsed.query)
+            values = qs.get("page_info")
+            if values:
+                return values[0]
+    return None
+
+
 def get_all_products_by_sku():
-    """Returnează dict {sku: product_data} pentru toate produsele din Shopify."""
+    """
+    Returnează dict {sku: product_data} pentru toate produsele din Shopify.
+    """
     sku_map = {}
-    params = {"limit": 250}
+    page_info = None
+    total = 0
+
     while True:
-        data = shopify_get("/products.json", params)
-        for product in data.get("products", []):
+        params = {"limit": 250}
+        if page_info:
+            params["page_info"] = page_info
+
+        response = shopify_get("/products.json", params)
+        data = response.json()
+
+        products = data.get("products", [])
+        total += len(products)
+
+        for product in products:
             for variant in product.get("variants", []):
-                if variant.get("sku"):
-                    sku_map[variant["sku"]] = {
+                sku = variant.get("sku")
+                if sku:
+                    sku_map[sku] = {
                         "product_id": product["id"],
                         "variant_id": variant["id"],
                         "inventory_item_id": variant["inventory_item_id"],
                     }
-        # paginare
-        link = None  # simplu – pentru volume foarte mari poți adăuga cursor pagination
-        break
+
+        page_info = extract_next_page_info(response.headers.get("Link"))
+        if not page_info:
+            break
+
+        time.sleep(RATE_LIMIT_DELAY)
+
+    log.info(f"Produse existente în Shopify scanate: {total} | SKU-uri indexate: {len(sku_map)}")
     return sku_map
 
 
 # ── Feed parser ───────────────────────────────────────────────────────────────
-def parse_feed(url):
-    log.info(f"Descarcă feed: {url}")
-    r = requests.get(url, timeout=60)
-    r.raise_for_status()
-
-    root = ET.fromstring(r.content)
-
+def parse_single_feed_page(xml_content):
+    root = ET.fromstring(xml_content)
     products = []
 
     items = root.findall(".//Product")
-
-    log.info(f"Produse găsite în feed: {len(items)}")
+    log.info(f"Produse găsite în pagina curentă de feed: {len(items)}")
 
     for item in items:
         def t(tag):
@@ -108,7 +152,6 @@ def parse_feed(url):
         if not sku:
             continue
 
-        # curățare preț românesc
         price_clean = (
             price_raw.replace("lei", "")
             .replace("Lei", "")
@@ -119,12 +162,12 @@ def parse_feed(url):
 
         try:
             price = f"{float(price_clean):.2f}"
-        except:
+        except Exception:
             price = "0.00"
 
         try:
             stock = int(float(stock_raw.replace(",", ".")))
-        except:
+        except Exception:
             stock = 0
 
         products.append({
@@ -137,38 +180,76 @@ def parse_feed(url):
             "category": "",
         })
 
-    log.info(f"Produse parse-uite: {len(products)}")
+    return root, products
 
-    return products
+
+def get_next_feed_url(root):
+    next_page = root.find(".//next_page_url")
+    if next_page is not None and next_page.text:
+        return next_page.text.strip()
+    return None
+
+
+def parse_feed(url):
+    """
+    Parsează toate paginile feed-ului XML.
+    """
+    all_products = []
+    page = 1
+    current_url = url
+
+    while current_url:
+        log.info(f"Descarcă feed pagina {page}: {current_url}")
+        r = requests.get(current_url, timeout=60)
+        r.raise_for_status()
+
+        root, products = parse_single_feed_page(r.content)
+        all_products.extend(products)
+
+        next_url = get_next_feed_url(root)
+
+        # protecție să nu intre în buclă infinită
+        if not next_url or next_url == current_url:
+            break
+
+        current_url = next_url
+        page += 1
+        time.sleep(0.2)
+
+    log.info(f"Produse parse-uite total din toate paginile: {len(all_products)}")
+    return all_products
+
 
 # ── Shopify sync ──────────────────────────────────────────────────────────────
 def get_location_id():
-    data = shopify_get("/locations.json")
+    response = shopify_get("/locations.json")
+    data = response.json()
     locations = data.get("locations", [])
     if not locations:
         raise RuntimeError("Nu s-a găsit nicio locație în Shopify.")
     return locations[0]["id"]
 
+
 def create_product(p, location_id):
     payload = {
         "product": {
-            "title":       p["title"],
-            "body_html":   p["description"],
+            "title": p["title"],
+            "body_html": p["description"],
             "product_type": p["category"],
             "variants": [{
-                "sku":               p["sku"],
-                "price":             p["price"],
+                "sku": p["sku"],
+                "price": p["price"],
                 "inventory_management": "shopify",
-                "inventory_policy":  "deny",
+                "inventory_policy": "deny",
             }],
         }
     }
+
     data = shopify_post("/products.json", payload)
     product_id = data["product"]["id"]
     variant_id = data["product"]["variants"][0]["id"]
     inv_item_id = data["product"]["variants"][0]["inventory_item_id"]
 
-    # Adaugă imaginea
     if p["image_url"]:
         try:
             shopify_post(f"/products/{product_id}/images.json", {
@@ -177,39 +258,42 @@ def create_product(p, location_id):
         except Exception as e:
             log.warning(f"Imagine eșuată pentru {p['sku']}: {e}")
 
-    # Setează stoc
     set_inventory(inv_item_id, location_id, p["stock"])
 
-    log.info(f"  ✅ Creat: {p['title']} (SKU: {p['sku']})")
+    log.info(f"✅ Creat: {p['title']} (SKU: {p['sku']})")
     return variant_id, inv_item_id
 
+
 def update_product(existing, p, location_id):
-    product_id  = existing["product_id"]
-    variant_id  = existing["variant_id"]
+    product_id = existing["product_id"]
+    variant_id = existing["variant_id"]
     inv_item_id = existing["inventory_item_id"]
 
-    # Update preț și titlu
     shopify_put(f"/products/{product_id}.json", {
         "product": {
-            "id":      product_id,
-            "title":   p["title"],
+            "id": product_id,
+            "title": p["title"],
             "body_html": p["description"],
         }
     })
+
     shopify_put(f"/variants/{variant_id}.json", {
-        "variant": {"id": variant_id, "price": p["price"]}
+        "variant": {
+            "id": variant_id,
+            "price": p["price"]
+        }
     })
 
-    # Update stoc
     set_inventory(inv_item_id, location_id, p["stock"])
 
-    log.info(f"  🔄 Updated: {p['title']} (SKU: {p['sku']})")
+    log.info(f"🔄 Updated: {p['title']} (SKU: {p['sku']})")
+
 
 def set_inventory(inventory_item_id, location_id, quantity):
     shopify_post("/inventory_levels/set.json", {
-        "location_id":        location_id,
-        "inventory_item_id":  inventory_item_id,
-        "available":          quantity,
+        "location_id": location_id,
+        "inventory_item_id": inventory_item_id,
+        "available": quantity,
     })
 
 
@@ -219,17 +303,17 @@ def main():
     log.info(f"Start sync — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     log.info("=" * 60)
 
-    products    = parse_feed(FEED_URL)
+    products = parse_feed(FEED_URL)
     if not products:
         log.error("Feed gol sau eroare de parsare. Opresc.")
         return
 
     location_id = get_location_id()
-    existing    = get_all_products_by_sku()
+    existing = get_all_products_by_sku()
 
     created = updated = errors = 0
 
-    for p in products:
+    for idx, p in enumerate(products, start=1):
         try:
             if p["sku"] in existing:
                 update_product(existing[p["sku"]], p, location_id)
@@ -237,13 +321,18 @@ def main():
             else:
                 create_product(p, location_id)
                 created += 1
+
+            if idx % 50 == 0:
+                log.info(f"Progress: {idx}/{len(products)} produse procesate")
+
             time.sleep(RATE_LIMIT_DELAY)
+
         except Exception as e:
-            log.error(f"  ❌ Eroare la {p['sku']}: {e}")
+            log.error(f"❌ Eroare la {p['sku']}: {e}")
             errors += 1
 
     log.info("=" * 60)
-    log.info(f"✅ Creat: {created}  |  🔄 Actualizat: {updated}  |  ❌ Erori: {errors}")
+    log.info(f"✅ Creat: {created} | 🔄 Actualizat: {updated} | ❌ Erori: {errors}")
     log.info("=" * 60)
 
 
