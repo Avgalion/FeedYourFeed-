@@ -62,51 +62,35 @@ def get_all_products_by_sku():
 
 # ── Feed parser ───────────────────────────────────────────────────────────────
 def parse_feed(url):
-    """Parsează feed-ul XML și returnează lista de produse."""
     log.info(f"Descarcă feed: {url}")
     r = requests.get(url, timeout=60)
     r.raise_for_status()
+
     root = ET.fromstring(r.content)
 
     products = []
 
-    items = (
-        root.findall(".//Product") or
-        root.findall(".//product") or
-        root.findall(".//SHOPITEM") or
-        root.findall(".//item")
-    )
-
-    if not items:
-        log.warning("Nu s-au găsit produse în feed. Verifică structura XML.")
-        return products
+    items = root.findall(".//Product")
 
     log.info(f"Produse găsite în feed: {len(items)}")
 
     for item in items:
-        def g(tag):
-            for child in item:
-                if child.tag.lower() == tag.lower():
-                    return (child.text or "").strip()
-            return ""
+        def t(tag):
+            el = item.find(tag)
+            return (el.text or "").strip() if el is not None else ""
 
-        sku         = g("reference") or g("sku") or g("cod") or g("code") or g("id")
-        title       = g("name") or g("title") or g("denumire") or g("nume")
-        description = g("description") or g("descriere") or g("body")
-        price_raw   = g("pret") or g("price") or g("price_with_vat")
-        stock_raw   = g("stoc") or g("stock") or g("quantity") or g("cantitate") or "0"
-        image_url   = g("image") or g("imagine") or g("image_url") or g("img")
-        category    = g("category") or g("categorie") or g("categories")
-        barcode     = g("barcodes_barcode") or g("barcode")
+        sku = t("reference")
+        title = t("name")
+        price_raw = t("pret")
+        stock_raw = t("stoc")
 
         if not sku:
             continue
 
+        # curățare preț românesc
         price_clean = (
-            price_raw.replace("RON", "")
+            price_raw.replace("lei", "")
             .replace("Lei", "")
-            .replace("lei", "")
-            .replace(" ", "")
             .replace(".", "")
             .replace(",", ".")
             .strip()
@@ -114,27 +98,25 @@ def parse_feed(url):
 
         try:
             price = f"{float(price_clean):.2f}"
-        except ValueError:
+        except:
             price = "0.00"
 
         try:
             stock = int(float(stock_raw.replace(",", ".")))
-        except ValueError:
+        except:
             stock = 0
 
         products.append({
             "sku": sku,
             "title": title or sku,
-            "description": description,
+            "description": "",
             "price": price,
             "stock": stock,
-            "image_url": image_url,
-            "category": category,
-            "barcode": barcode,
+            "image_url": "",
+            "category": "",
         })
 
-        if len(products) <= 5:
-            log.info(f"Parsed: sku={sku}, title={title}, price={price}, stock={stock}")
+    log.info(f"Produse parse-uite: {len(products)}")
 
     return products
 
